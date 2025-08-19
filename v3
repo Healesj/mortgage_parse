@@ -1,0 +1,1291 @@
+#!/usr/bin/env python3
+
+"""
+Enhanced UK Mortgage Rate PDF Parser
+
+A comprehensive tool for parsing mortgage rate PDFs from multiple UK lenders
+with robust data extraction and multiple parsing strategies to minimize data loss.
+
+Features:
+- Multiple extraction methods (tables, text, hybrid)
+- Comprehensive data cleaning and validation
+- Support for all major UK lenders
+- Batch processing capabilities
+- Export to JSON/CSV with detailed logging
+- Rate comparison and analysis functions
+
+Author: Enhanced Mortgage Parser
+Date: August 2025
+"""
+
+import argparse
+import csv
+import json
+import logging
+import re
+import sys
+import traceback
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any, Union
+from datetime import datetime
+import warnings
+
+# Suppress warnings from PDF libraries
+warnings.filterwarnings("ignore")
+
+# PDF parsing libraries
+try:
+    import pdfplumber
+
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+
+try:
+    import pandas as pd
+
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+try:
+    import numpy as np
+
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
+
+@dataclass
+class MortgageProduct:
+    """Standardized mortgage product data structure"""
+    product_id: str = ""
+    lender: str = ""
+    product_type: str = ""
+    customer_type: str = ""
+    rate: Optional[float] = None
+    term_years: Optional[float] = None
+    ltv_min: Optional[float] = None
+    ltv_max: Optional[float] = None
+    fee: Optional[float] = None
+    min_loan: Optional[float] = None
+    max_loan: Optional[float] = None
+    repayment_type: str = ""
+    special_features: List[str] = field(default_factory=list)
+    cashback: Optional[float] = None
+    free_valuation: Optional[bool] = None
+    free_legals: Optional[bool] = None
+    erc: Optional[str] = None
+    completion_deadline: Optional[str] = None
+    description: str = ""
+    raw_data: Dict[str, str] = field(default_factory=dict)  # Store original extracted data
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization"""
+        result = asdict(self)
+        # Convert numpy types to native Python types
+        for key, value in result.items():
+            if NUMPY_AVAILABLE and isinstance(value, (np.integer, np.floating)):
+                result[key] = value.item()
+        return result
+
+    def validate(self) -> List[str]:
+        """Validate product data and return list of errors"""
+        errors = []
+
+        if not self.product_id:
+            errors.append("Missing product_id")
+        if not self.lender:
+            errors.append("Missing lender")
+        if self.rate is not None:
+            if self.rate <= 0 or self.rate > 25:
+                errors.append(f"Invalid rate: {self.rate}%")
+        if self.fee is not None and self.fee < 0:
+            errors.append(f"Invalid fee: £{self.fee}")
+        if self.ltv_max is not None and (self.ltv_max <= 0 or self.ltv_max > 100):
+            errors.append(f"Invalid max_ltv: {self.ltv_max}%")
+        if self.min_loan is not None and self.min_loan < 0:
+            errors.append(f"Invalid min_loan: £{self.min_loan}")
+        if self.max_loan is not None and self.max_loan < 0:
+            errors.append(f"Invalid max_loan: £{self.max_loan}")
+        if (self.min_loan is not None and self.max_loan is not None
+                and self.min_loan > self.max_loan):
+            errors.append(f"min_loan > max_loan: £{self.min_loan} > £{self.max_loan}")
+        if self.term_years is not None and (self.term_years <= 0 or self.term_years > 50):
+            errors.append(f"Invalid term_years: {self.term_years}")
+
+        return errors
+
+
+class EnhancedMortgageParser:
+    """Enhanced mortgage PDF parser with multiple extraction strategies"""
+
+    def __init__(self, debug: bool = False):
+        """Initialize the enhanced parser"""
+        self.debug = debug
+        self.logger = self._setup_logging()
+        self.stats = {
+            'files_processed': 0,
+            'products_extracted': 0,
+            'errors_encountered': 0,
+            'validation_failures': 0
+        }
+
+        # Lender detection patterns
+        self.lender_patterns = {
+            'Halifax': [
+                r'halifax.*intermediar',
+                r'halifax.*rate.*guide',
+                r'product.*code.*uay',
+                r'gst\d{3}'
+            ],
+            'Santander': [
+                r'santander.*product.*transfer',
+                r'santander.*residential',
+                r'bbr.*plus.*\d+\.\d+%',
+                r'f\d{3}p'
+            ],
+            'HSBC': [
+                r'hsbc.*uk.*mortgage',
+                r'hsbc.*rate.*sheet',
+                r'contract.*id.*\d{9}',
+                r'current.*residential.*svr'
+            ],
+            'Nationwide': [
+                r'nationwide',
+                r'rates.*valid.*\d{2}.*\d{2}.*\d{2}',
+                r'hide.*details',
+                r'\d{6}.*customer.*type'
+            ],
+            'NatWest': [
+                r'natwest',
+                r'information.*classification.*restricted',
+                r'fo\d{6}',
+                r'new.*customer.*mortgage'
+            ]
+        }
+
+        # Common field patterns for data extraction
+        self.field_patterns = {
+            'rate': [
+                r'(\d+\.?\d*)\s*%',
+                r'rate.*?(\d+\.?\d*)',
+                r'(\d+\.\d+)%'
+            ],
+            'term': [
+                r'(\d+\.?\d*)\s*(?:year|yr)s?',
+                r'(\d+)\s*yr\s*fixed',
+                r'(\d+)\s*year\s*fixed'
+            ],
+            'fee': [
+                r'£(\d{1,3}(?:,\d{3})*)',
+                r'fee.*?£?(\d+(?:,\d{3})*)',
+                r'(\d+)\s*product.*fee'
+            ],
+            'ltv': [
+                r'(\d+)%.*ltv',
+                r'ltv.*?(\d+)%?',
+                r'(?:<=|≤)(\d+)%'
+            ],
+            'loan_amount': [
+                r'£(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
+                r'(\d+(?:,\d{3})*)\s*(?:minimum|maximum|min|max)',
+                r'(\d+(?:\.\d+)?[mk]?)\s*(?:loan|borrowing)'
+            ],
+            'product_code': [
+                r'[A-Z]{2,4}\d{3,6}[A-Z]?',
+                r'F\d{3,4}[A-Z]?',
+                r'\d{6,9}',
+                r'[A-Z]+\d+[A-Z]*'
+            ]
+        }
+
+    def _setup_logging(self) -> logging.Logger:
+        """Setup comprehensive logging"""
+        logger = logging.getLogger('EnhancedMortgageParser')
+        logger.setLevel(logging.DEBUG if self.debug else logging.INFO)
+
+        # Remove existing handlers
+        logger.handlers.clear()
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+
+        # File handler
+        file_handler = logging.FileHandler('parsing_log.txt', mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+        )
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+
+        return logger
+
+    def detect_lender(self, content: str, filename: str = "") -> str:
+        """Enhanced lender detection using multiple methods"""
+        content_lower = content.lower()
+        filename_lower = filename.lower()
+
+        # Check filename first
+        for lender in self.lender_patterns.keys():
+            if lender.lower() in filename_lower:
+                self.logger.debug(f"Detected {lender} from filename: {filename}")
+                return lender
+
+        # Check content patterns
+        for lender, patterns in self.lender_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, content_lower, re.IGNORECASE):
+                    self.logger.debug(f"Detected {lender} from pattern: {pattern}")
+                    return lender
+
+        self.logger.warning(f"Could not detect lender for file: {filename}")
+        return "Unknown"
+
+    def extract_tables_comprehensive(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using multiple methods for comprehensive coverage"""
+        all_tables = []
+
+        if not PDFPLUMBER_AVAILABLE:
+            self.logger.error("pdfplumber not available for table extraction")
+            return all_tables
+
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    self.logger.debug(f"Extracting tables from page {page_num + 1}")
+
+                    # Method 1: Standard table extraction
+                    try:
+                        tables = page.extract_tables()
+                        if tables:
+                            for table in tables:
+                                if table and len(table) > 1:  # Must have header + data
+                                    all_tables.append(table)
+                                    self.logger.debug(f"Extracted table with {len(table)} rows")
+                    except Exception as e:
+                        self.logger.debug(f"Standard table extraction failed: {e}")
+
+                    # Method 2: Custom table settings for complex layouts
+                    try:
+                        custom_tables = page.extract_tables(table_settings={
+                            "vertical_strategy": "lines_strict",
+                            "horizontal_strategy": "lines_strict",
+                            "snap_tolerance": 3,
+                            "join_tolerance": 3,
+                            "edge_min_length": 3,
+                            "min_words_vertical": 1,
+                            "min_words_horizontal": 1,
+                            "intersection_tolerance": 3
+                        })
+                        if custom_tables:
+                            for table in custom_tables:
+                                if table and len(table) > 1:
+                                    all_tables.append(table)
+                                    self.logger.debug(f"Extracted custom table with {len(table)} rows")
+                    except Exception as e:
+                        self.logger.debug(f"Custom table extraction failed: {e}")
+
+                    # Method 3: Relaxed table extraction for borderless tables
+                    try:
+                        relaxed_tables = page.extract_tables(table_settings={
+                            "vertical_strategy": "text",
+                            "horizontal_strategy": "text",
+                            "text_tolerance": 3,
+                            "text_x_tolerance": 1,
+                            "text_y_tolerance": 1
+                        })
+                        if relaxed_tables:
+                            for table in relaxed_tables:
+                                if table and len(table) > 1:
+                                    all_tables.append(table)
+                                    self.logger.debug(f"Extracted relaxed table with {len(table)} rows")
+                    except Exception as e:
+                        self.logger.debug(f"Relaxed table extraction failed: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to extract tables from {pdf_path}: {e}")
+
+        self.logger.info(f"Extracted {len(all_tables)} total tables from {pdf_path}")
+        return all_tables
+
+    def extract_text_comprehensive(self, pdf_path: str) -> str:
+        """Extract text using multiple methods for comprehensive coverage"""
+        text_content = ""
+
+        if not PDFPLUMBER_AVAILABLE:
+            self.logger.error("pdfplumber not available for text extraction")
+            return text_content
+
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    try:
+                        # Method 1: Standard text extraction
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_content += f"\n--- Page {page_num + 1} ---\n"
+                            text_content += page_text + "\n"
+                    except Exception as e:
+                        self.logger.debug(f"Standard text extraction failed for page {page_num + 1}: {e}")
+
+                    try:
+                        # Method 2: Text with layout preservation
+                        layout_text = page.extract_text(layout=True)
+                        if layout_text and layout_text != page_text:
+                            text_content += f"\n--- Page {page_num + 1} (Layout) ---\n"
+                            text_content += layout_text + "\n"
+                    except Exception as e:
+                        self.logger.debug(f"Layout text extraction failed for page {page_num + 1}: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to extract text from {pdf_path}: {e}")
+
+        return text_content
+
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize extracted text"""
+        if not text:
+            return ""
+
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text.strip())
+
+        # Fix common OCR issues
+        text = text.replace('&lt;=', '<=')
+        text = text.replace('&gt;=', '>=')
+        text = text.replace('&amp;', '&')
+        text = text.replace('â€™', "'")
+        text = text.replace('â€œ', '"')
+        text = text.replace('â€', '"')
+
+        return text
+
+    def extract_numeric_value(self, text: str, patterns: List[str]) -> Optional[float]:
+        """Extract numeric value using multiple patterns"""
+        if not text:
+            return None
+
+        text = self.clean_text(str(text))
+
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                try:
+                    # Clean the match
+                    value = str(match).replace(',', '').replace('£', '').strip()
+
+                    # Handle special cases
+                    if value.lower().endswith('k'):
+                        return float(value[:-1]) * 1000
+                    elif value.lower().endswith('m'):
+                        return float(value[:-1]) * 1000000
+                    elif value:
+                        return float(value)
+                except (ValueError, AttributeError):
+                    continue
+
+        return None
+
+    def normalize_product_type(self, text: str) -> str:
+        """Normalize product type from various formats"""
+        if not text:
+            return ""
+
+        text = text.lower().strip()
+
+        # Fixed rate products
+        fixed_match = re.search(r'(\d+\.?\d*)\s*(?:year|yr)s?\s*fixed', text)
+        if fixed_match:
+            return f"{fixed_match.group(1)} Year Fixed"
+
+        # Tracker products
+        if any(word in text for word in ['tracker', 'track', 'bbr']):
+            tracker_match = re.search(r'(\d+\.?\d*)\s*(?:year|yr)s?\s*tracker', text)
+            if tracker_match:
+                return f"{tracker_match.group(1)} Year Tracker"
+            return "Tracker"
+
+        # Variable rate products
+        if any(word in text for word in ['variable', 'svr']):
+            return "Variable"
+
+        # Default classifications
+        if 'fixed' in text:
+            return "Fixed"
+
+        return text.title()
+
+    def normalize_customer_type(self, text: str) -> str:
+        """Normalize customer type from various formats"""
+        if not text:
+            return ""
+
+        text = text.lower().strip()
+
+        # First time buyer variations
+        if any(phrase in text for phrase in ['first time buyer', 'ftb', 'first buyer']):
+            return "First Time Buyer"
+
+        # Home mover variations
+        if any(phrase in text for phrase in ['home mover', 'homemover', 'mover']):
+            if 'new' in text:
+                return "Home Mover (New)"
+            elif 'existing' in text:
+                return "Home Mover (Existing)"
+            return "Home Mover"
+
+        # Remortgage variations
+        if any(phrase in text for phrase in ['remortgage', 'remort', 'switcher']):
+            return "Remortgage"
+
+        # Buy to Let variations
+        if any(phrase in text for phrase in ['buy to let', 'btl', 'b2l', 'rental']):
+            return "Buy to Let"
+
+        # Additional borrowing
+        if any(phrase in text for phrase in ['additional borrowing', 'further advance']):
+            return "Additional Borrowing"
+
+        # Product transfer
+        if any(phrase in text for phrase in ['product transfer', 'rate switch']):
+            return "Product Transfer"
+
+        # Purchase (generic)
+        if 'purchase' in text:
+            return "Purchase"
+
+        return text.title()
+
+    def extract_special_features(self, text: str) -> List[str]:
+        """Extract special features from text"""
+        features = []
+        if not text:
+            return features
+
+        text_lower = text.lower()
+
+        feature_keywords = {
+            'Green': ['green', 'energy efficient', 'eeh'],
+            'New Build': ['new build', 'newbuild'],
+            'Help to Buy': ['help to buy', 'htb', 'shared equity'],
+            'Shared Ownership': ['shared ownership'],
+            'High Value': ['high value', 'hvm'],
+            'Interest Only': ['interest only', 'int only'],
+            'Offset': ['offset'],
+            'Premier': ['premier'],
+            'Fee Saver': ['fee saver'],
+            'Standard': ['standard'],
+            'Equity Share': ['equity share'],
+            'First Homes': ['first homes']
+        }
+
+        for feature, keywords in feature_keywords.items():
+            if any(keyword in text_lower for keyword in keywords):
+                features.append(feature)
+
+        return features
+
+    def parse_table_data(self, table: List[List[str]], lender: str) -> List[MortgageProduct]:
+        """Parse table data into mortgage products with lender-specific logic"""
+        products = []
+
+        if not table or len(table) < 2:
+            return products
+
+        self.logger.debug(f"Parsing table with {len(table)} rows for {lender}")
+
+        # Find header row
+        header_row_idx = self._find_header_row(table)
+        if header_row_idx is None:
+            self.logger.debug("No header row found, trying to parse without headers")
+            header_row_idx = 0
+
+        headers = [str(cell).lower().strip() if cell else '' for cell in table[header_row_idx]]
+        self.logger.debug(f"Headers found: {headers}")
+
+        # Map columns to standard fields
+        column_mapping = self._map_columns(headers, lender)
+        self.logger.debug(f"Column mapping: {column_mapping}")
+
+        # Parse data rows
+        for row_idx, row in enumerate(table[header_row_idx + 1:], start=header_row_idx + 1):
+            if not row or not any(cell for cell in row if cell and str(cell).strip()):
+                continue
+
+            try:
+                product = self._parse_table_row(row, column_mapping, lender, row_idx)
+                if product and (product.rate is not None or product.product_id):
+                    products.append(product)
+                    self.logger.debug(f"Extracted product: {product.product_id} - {product.rate}%")
+            except Exception as e:
+                self.logger.warning(f"Failed to parse row {row_idx}: {e}")
+                if self.debug:
+                    self.logger.debug(f"Row data: {row}")
+
+        return products
+
+    def _find_header_row(self, table: List[List[str]]) -> Optional[int]:
+        """Find the header row in a table"""
+        header_indicators = [
+            'rate', 'product', 'ltv', 'fee', 'term', 'code', 'type', 'customer',
+            'offer rate', 'booking fee', 'initial rate', 'contract id', 'until'
+        ]
+
+        for row_idx, row in enumerate(table[:5]):  # Check first 5 rows
+            if not row:
+                continue
+
+            row_text = ' '.join(str(cell).lower() for cell in row if cell).strip()
+            matches = sum(1 for indicator in header_indicators if indicator in row_text)
+
+            if matches >= 2:  # Need at least 2 header indicators
+                return row_idx
+
+        return None
+
+    def _map_columns(self, headers: List[str], lender: str) -> Dict[str, int]:
+        """Map table columns to standard fields"""
+        mapping = {}
+
+        # Common column mappings
+        column_patterns = {
+            'product_id': ['product code', 'code', 'contract id', 'product id'],
+            'product_type': ['product type', 'type', 'product', 'description'],
+            'rate': ['rate', 'initial rate', 'offer rate', 'interest rate'],
+            'term': ['term', 'until', 'period', 'years', 'year'],
+            'fee': ['fee', 'product fee', 'booking fee', 'arrangement fee'],
+            'ltv_min': ['min ltv', 'ltv min', 'minimum ltv'],
+            'ltv_max': ['max ltv', 'ltv max', 'maximum ltv', 'ltv'],
+            'min_loan': ['min loan', 'minimum loan', 'minimum borrowing'],
+            'max_loan': ['max loan', 'maximum loan', 'rate borrowing limit'],
+            'cashback': ['cashback', 'cash back'],
+            'customer_type': ['customer type', 'customer', 'type'],
+            'completion_deadline': ['complete by', 'completion deadline', 'deadline']
+        }
+
+        # Find matching columns
+        for field, patterns in column_patterns.items():
+            for col_idx, header in enumerate(headers):
+                if any(pattern in header for pattern in patterns):
+                    mapping[field] = col_idx
+                    break
+
+        # Lender-specific adjustments
+        if lender == 'Halifax':
+            # Halifax specific column detection
+            for col_idx, header in enumerate(headers):
+                if 'uay' in header or 'gst' in header:
+                    mapping['green_code'] = col_idx
+
+        elif lender == 'Santander':
+            # Santander specific patterns
+            for col_idx, header in enumerate(headers):
+                if 'differential' in header:
+                    mapping['base_rate_diff'] = col_idx
+
+        elif lender == 'HSBC':
+            # HSBC specific patterns
+            for col_idx, header in enumerate(headers):
+                if 'contract' in header and 'id' in header:
+                    mapping['product_id'] = col_idx
+
+        return mapping
+
+    def _parse_table_row(self, row: List[str], column_mapping: Dict[str, int],
+                         lender: str, row_idx: int) -> Optional[MortgageProduct]:
+        """Parse a single table row into a mortgage product"""
+        product = MortgageProduct()
+        product.lender = lender
+
+        # Store raw data for debugging
+        product.raw_data = {f"col_{i}": str(cell) if cell else "" for i, cell in enumerate(row)}
+
+        # Extract mapped fields
+        for field, col_idx in column_mapping.items():
+            if col_idx < len(row) and row[col_idx]:
+                cell_value = str(row[col_idx]).strip()
+
+                if field == 'product_id':
+                    product.product_id = cell_value
+
+                elif field == 'rate':
+                    product.rate = self.extract_numeric_value(cell_value, self.field_patterns['rate'])
+
+                elif field == 'term':
+                    term_match = re.search(r'(\d+\.?\d*)', cell_value)
+                    if term_match:
+                        product.term_years = float(term_match.group(1))
+
+                elif field == 'fee':
+                    product.fee = self.extract_numeric_value(cell_value, self.field_patterns['fee'])
+
+                elif field in ['ltv_min', 'ltv_max']:
+                    ltv_value = self.extract_numeric_value(cell_value, self.field_patterns['ltv'])
+                    if ltv_value is not None:
+                        # Convert to percentage if needed
+                        if ltv_value <= 1:
+                            ltv_value *= 100
+                        setattr(product, field, ltv_value)
+
+                elif field in ['min_loan', 'max_loan']:
+                    loan_value = self.extract_numeric_value(cell_value, self.field_patterns['loan_amount'])
+                    setattr(product, field, loan_value)
+
+                elif field == 'cashback':
+                    product.cashback = self.extract_numeric_value(cell_value, self.field_patterns['fee'])
+
+                elif field == 'product_type':
+                    product.product_type = self.normalize_product_type(cell_value)
+
+                elif field == 'customer_type':
+                    product.customer_type = self.normalize_customer_type(cell_value)
+
+                elif field == 'completion_deadline':
+                    product.completion_deadline = cell_value
+
+        # Try to infer missing fields from other columns
+        self._infer_missing_fields(product, row, lender)
+
+        # Extract special features from description
+        full_row_text = ' '.join(str(cell) for cell in row if cell)
+        product.special_features = self.extract_special_features(full_row_text)
+        product.description = full_row_text[:200]  # First 200 chars as description
+
+        # Set defaults
+        if not product.product_id:
+            product.product_id = f"{lender}_{row_idx}"
+
+        return product
+
+    def _infer_missing_fields(self, product: MortgageProduct, row: List[str], lender: str):
+        """Infer missing fields from row data"""
+
+        # Try to find product ID if missing
+        if not product.product_id:
+            for cell in row:
+                if cell:
+                    cell_str = str(cell).strip()
+                    for pattern in self.field_patterns['product_code']:
+                        match = re.search(pattern, cell_str, re.IGNORECASE)
+                        if match:
+                            product.product_id = match.group()
+                            break
+                    if product.product_id:
+                        break
+
+        # Try to find rate if missing
+        if product.rate is None:
+            for cell in row:
+                if cell:
+                    rate = self.extract_numeric_value(str(cell), self.field_patterns['rate'])
+                    if rate is not None and 0.1 <= rate <= 20:
+                        product.rate = rate
+                        break
+
+        # Set boolean fields based on text content
+        full_text = ' '.join(str(cell).lower() for cell in row if cell)
+        product.free_valuation = 'free val' in full_text or 'free valuation' in full_text
+        product.free_legals = 'free legal' in full_text or 'free legals' in full_text
+
+    def parse_text_data(self, text: str, lender: str) -> List[MortgageProduct]:
+        """Parse text data using regex patterns for products not captured in tables"""
+        products = []
+
+        if not text:
+            return products
+
+        self.logger.debug(f"Parsing text data for {lender}")
+
+        # Lender-specific text parsing
+        if lender == 'Halifax':
+            products.extend(self._parse_halifax_text(text))
+        elif lender == 'Santander':
+            products.extend(self._parse_santander_text(text))
+        elif lender == 'HSBC':
+            products.extend(self._parse_hsbc_text(text))
+        elif lender == 'Nationwide':
+            products.extend(self._parse_nationwide_text(text))
+        elif lender == 'NatWest':
+            products.extend(self._parse_natwest_text(text))
+
+        # Generic text parsing patterns
+        products.extend(self._parse_generic_text(text, lender))
+
+        return products
+
+    def _parse_halifax_text(self, text: str) -> List[MortgageProduct]:
+        """Parse Halifax-specific text patterns"""
+        products = []
+
+        # Halifax rate line pattern
+        pattern = r'(\d+\.?\d*)\s+(\d+\.\d+)\s+\d{2}/\d{2}/\d{4}\s+£(\d+(?:,\d{3})*)\s+£(\d+(?:,\d{3})*)\s+£(\d+(?:,\d{3})*)\s+(\d+)\s+(\d+)\s+\d{2}/\d{2}/\d{4}\s+([A-Z]{3}\d+)\s*([A-Z]{3}\d+)?'
+
+        for match in re.finditer(pattern, text, re.MULTILINE):
+            try:
+                product = MortgageProduct()
+                product.lender = "Halifax"
+                product.term_years = float(match.group(1))
+                product.rate = float(match.group(2))
+                product.fee = self.extract_numeric_value(match.group(3), [r'\d+'])
+                product.min_loan = self.extract_numeric_value(match.group(4), [r'\d+'])
+                product.max_loan = self.extract_numeric_value(match.group(5), [r'\d+'])
+                product.ltv_min = float(match.group(6))
+                product.ltv_max = float(match.group(7))
+                product.product_id = match.group(8)
+                product.product_type = f"{int(product.term_years)} Year Fixed"
+
+                if match.group(9):  # Green code present
+                    product.special_features.append("Green")
+
+                products.append(product)
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse Halifax text pattern: {e}")
+
+        return products
+
+    def _parse_santander_text(self, text: str) -> List[MortgageProduct]:
+        """Parse Santander-specific text patterns"""
+        products = []
+
+        # Santander product transfer pattern
+        pattern = r'c\s+(\d+)\s+Yr\s+Fixed.*?(\d+\.\d+%)\s+([A-Z]\d{3,4}[A-Z]?)\s+\d{2}/\d{2}/\d{4}\s+£(\d+)\s+(\d+%)'
+
+        for match in re.finditer(pattern, text):
+            try:
+                product = MortgageProduct()
+                product.lender = "Santander"
+                product.term_years = float(match.group(1))
+                product.rate = self.extract_numeric_value(match.group(2), [r'\d+\.\d+'])
+                product.product_id = match.group(3)
+                product.fee = self.extract_numeric_value(match.group(4), [r'\d+'])
+                product.product_type = f"{int(product.term_years)} Year Fixed"
+                product.customer_type = "Product Transfer"
+
+                products.append(product)
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse Santander text pattern: {e}")
+
+        return products
+
+    def _parse_hsbc_text(self, text: str) -> List[MortgageProduct]:
+        """Parse HSBC-specific text patterns"""
+        products = []
+
+        # HSBC rate pattern
+        pattern = r'((?:Fee Saver|Standard|Premier)[^\n]*?)\s+(\d+\.\d+)%\s+£(\d+(?:,\d{3})*)\s+.*?(\d{9})'
+
+        for match in re.finditer(pattern, text):
+            try:
+                product = MortgageProduct()
+                product.lender = "HSBC"
+                product.product_type = self.normalize_product_type(match.group(1))
+                product.rate = float(match.group(2))
+                product.fee = self.extract_numeric_value(match.group(3), [r'\d+'])
+                product.product_id = match.group(4)
+                product.special_features = self.extract_special_features(match.group(1))
+
+                products.append(product)
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse HSBC text pattern: {e}")
+
+        return products
+
+    def _parse_nationwide_text(self, text: str) -> List[MortgageProduct]:
+        """Parse Nationwide-specific text patterns"""
+        products = []
+
+        # Nationwide product blocks
+        pattern = r'(\d{6})\n.*?(\d+\.\d+)%\s+(\d+)\s+years?\s+£(\d+(?:,\d{3})*)\s+(\d+)%'
+
+        for match in re.finditer(pattern, text, re.MULTILINE | re.DOTALL):
+            try:
+                product = MortgageProduct()
+                product.lender = "Nationwide"
+                product.product_id = match.group(1)
+                product.rate = float(match.group(2))
+                product.term_years = float(match.group(3))
+                product.fee = self.extract_numeric_value(match.group(4), [r'\d+'])
+                product.ltv_max = float(match.group(5))
+                product.product_type = f"{int(product.term_years)} Year Fixed"
+
+                products.append(product)
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse Nationwide text pattern: {e}")
+
+        return products
+
+    def _parse_natwest_text(self, text: str) -> List[MortgageProduct]:
+        """Parse NatWest-specific text patterns"""
+        products = []
+
+        # NatWest table-like pattern
+        pattern = r'([A-Z]{2}\d{6})\s+.*?(\d+\.\d+)%\s+£(\d+)\s+(C&I|Int Only)'
+
+        for match in re.finditer(pattern, text):
+            try:
+                product = MortgageProduct()
+                product.lender = "NatWest"
+                product.product_id = match.group(1)
+                product.rate = float(match.group(2))
+                product.fee = self.extract_numeric_value(match.group(3), [r'\d+'])
+                product.repayment_type = "Capital & Interest" if match.group(4) == "C&I" else "Interest Only"
+
+                products.append(product)
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse NatWest text pattern: {e}")
+
+        return products
+
+    def _parse_generic_text(self, text: str, lender: str) -> List[MortgageProduct]:
+        """Parse generic text patterns that might work across lenders"""
+        products = []
+
+        # Generic pattern: ProductCode Rate% Fee
+        pattern = r'([A-Z]{2,4}\d{3,6}[A-Z]?)\s+.*?(\d+\.\d+)%\s+.*?£(\d+(?:,\d{3})*)'
+
+        for match in re.finditer(pattern, text):
+            try:
+                product = MortgageProduct()
+                product.lender = lender
+                product.product_id = match.group(1)
+                product.rate = float(match.group(2))
+                product.fee = self.extract_numeric_value(match.group(3), [r'\d+'])
+
+                products.append(product)
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse generic text pattern: {e}")
+
+        return products
+
+    def process_pdf_file(self, pdf_path: str) -> Tuple[List[MortgageProduct], List[str]]:
+        """Process a single PDF file with comprehensive extraction"""
+        self.logger.info(f"Processing PDF file: {pdf_path}")
+        self.stats['files_processed'] += 1
+
+        errors = []
+        all_products = []
+
+        try:
+            # Extract content
+            self.logger.debug("Extracting tables...")
+            tables = self.extract_tables_comprehensive(pdf_path)
+
+            self.logger.debug("Extracting text...")
+            text = self.extract_text_comprehensive(pdf_path)
+
+            if not tables and not text:
+                error = f"No content extracted from {pdf_path}"
+                errors.append(error)
+                return [], errors
+
+            # Detect lender
+            lender = self.detect_lender(text, pdf_path)
+            self.logger.info(f"Detected lender: {lender}")
+
+            # Parse tables
+            for table_idx, table in enumerate(tables):
+                try:
+                    self.logger.debug(f"Parsing table {table_idx + 1}/{len(tables)}")
+                    table_products = self.parse_table_data(table, lender)
+                    all_products.extend(table_products)
+                    self.logger.debug(f"Extracted {len(table_products)} products from table {table_idx + 1}")
+                except Exception as e:
+                    error = f"Failed to parse table {table_idx + 1}: {str(e)}"
+                    errors.append(error)
+                    if self.debug:
+                        self.logger.error(f"{error}\n{traceback.format_exc()}")
+
+            # Parse text
+            try:
+                self.logger.debug("Parsing text content...")
+                text_products = self.parse_text_data(text, lender)
+                all_products.extend(text_products)
+                self.logger.debug(f"Extracted {len(text_products)} products from text")
+            except Exception as e:
+                error = f"Failed to parse text content: {str(e)}"
+                errors.append(error)
+                if self.debug:
+                    self.logger.error(f"{error}\n{traceback.format_exc()}")
+
+            # Remove duplicates
+            unique_products = self._remove_duplicates(all_products)
+            self.stats['products_extracted'] += len(unique_products)
+
+            self.logger.info(f"Extracted {len(unique_products)} unique products from {pdf_path}")
+            return unique_products, errors
+
+        except Exception as e:
+            error = f"Critical error processing {pdf_path}: {str(e)}"
+            self.logger.error(error)
+            errors.append(error)
+            self.stats['errors_encountered'] += 1
+            if self.debug:
+                self.logger.error(traceback.format_exc())
+            return [], errors
+
+    def _remove_duplicates(self, products: List[MortgageProduct]) -> List[MortgageProduct]:
+        """Remove duplicate products based on product_id and rate"""
+        seen = set()
+        unique_products = []
+
+        for product in products:
+            # Create identifier based on key fields
+            identifier = (product.product_id, product.rate, product.lender)
+
+            if identifier not in seen:
+                seen.add(identifier)
+                unique_products.append(product)
+
+        removed_count = len(products) - len(unique_products)
+        if removed_count > 0:
+            self.logger.debug(f"Removed {removed_count} duplicate products")
+
+        return unique_products
+
+    def validate_products(self, products: List[MortgageProduct]) -> Tuple[List[MortgageProduct], List[str]]:
+        """Validate all products and return valid ones with errors"""
+        valid_products = []
+        validation_errors = []
+
+        for i, product in enumerate(products):
+            errors = product.validate()
+            if errors:
+                error_msg = f"Product {i + 1} ({product.product_id}): {'; '.join(errors)}"
+                validation_errors.append(error_msg)
+                self.stats['validation_failures'] += 1
+                self.logger.debug(error_msg)
+            else:
+                valid_products.append(product)
+
+        self.logger.info(f"Validated {len(valid_products)}/{len(products)} products")
+        return valid_products, validation_errors
+
+    def process_directory(self, directory_path: str) -> Tuple[List[MortgageProduct], List[str]]:
+        """Process all PDF files in a directory"""
+        directory = Path(directory_path)
+        if not directory.exists():
+            error = f"Directory does not exist: {directory_path}"
+            self.logger.error(error)
+            return [], [error]
+
+        pdf_files = list(directory.glob("*.pdf"))
+        if not pdf_files:
+            error = f"No PDF files found in {directory_path}"
+            self.logger.warning(error)
+            return [], [error]
+
+        self.logger.info(f"Found {len(pdf_files)} PDF files to process")
+
+        all_products = []
+        all_errors = []
+
+        for pdf_file in pdf_files:
+            try:
+                products, errors = self.process_pdf_file(str(pdf_file))
+                all_products.extend(products)
+                all_errors.extend(errors)
+            except Exception as e:
+                error = f"Failed to process {pdf_file}: {str(e)}"
+                all_errors.append(error)
+                self.logger.error(error)
+
+        # Final deduplication across all files
+        unique_products = self._remove_duplicates(all_products)
+
+        self.logger.info(f"Processed {len(pdf_files)} files, extracted {len(unique_products)} unique products")
+        return unique_products, all_errors
+
+    def export_to_json(self, products: List[MortgageProduct], filename: str):
+        """Export products to JSON file"""
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump([product.to_dict() for product in products], f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Exported {len(products)} products to {filename}")
+        except Exception as e:
+            self.logger.error(f"Failed to export JSON: {e}")
+
+    def export_to_csv(self, products: List[MortgageProduct], filename: str):
+        """Export products to CSV file"""
+        if not products:
+            self.logger.warning("No products to export to CSV")
+            return
+
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=products[0].to_dict().keys())
+                writer.writeheader()
+                for product in products:
+                    # Convert list fields to strings
+                    row = product.to_dict()
+                    for key, value in row.items():
+                        if isinstance(value, list):
+                            row[key] = ', '.join(str(v) for v in value)
+                    writer.writerow(row)
+            self.logger.info(f"Exported {len(products)} products to {filename}")
+        except Exception as e:
+            self.logger.error(f"Failed to export CSV: {e}")
+
+    def generate_summary_report(self, products: List[MortgageProduct]) -> Dict[str, Any]:
+        """Generate comprehensive summary report"""
+        if not products:
+            return {"error": "No products to analyze", "stats": self.stats}
+
+        summary = {
+            "parsing_stats": dict(self.stats),
+            "summary_stats": {
+                "total_products": len(products),
+                "parsing_timestamp": datetime.now().isoformat()
+            },
+            "lender_breakdown": {},
+            "product_type_breakdown": {},
+            "customer_type_breakdown": {},
+            "rate_analysis": {},
+            "fee_analysis": {},
+            "ltv_analysis": {},
+            "special_features_analysis": {}
+        }
+
+        # Lender breakdown
+        for product in products:
+            lender = product.lender
+            if lender in summary["lender_breakdown"]:
+                summary["lender_breakdown"][lender] += 1
+            else:
+                summary["lender_breakdown"][lender] = 1
+
+        # Product type breakdown
+        for product in products:
+            ptype = product.product_type or "Unknown"
+            if ptype in summary["product_type_breakdown"]:
+                summary["product_type_breakdown"][ptype] += 1
+            else:
+                summary["product_type_breakdown"][ptype] = 1
+
+        # Customer type breakdown
+        for product in products:
+            ctype = product.customer_type or "Unknown"
+            if ctype in summary["customer_type_breakdown"]:
+                summary["customer_type_breakdown"][ctype] += 1
+            else:
+                summary["customer_type_breakdown"][ctype] = 1
+
+        # Rate analysis
+        rates = [p.rate for p in products if p.rate is not None]
+        if rates:
+            if NUMPY_AVAILABLE:
+                summary["rate_analysis"] = {
+                    "count": len(rates),
+                    "min": float(np.min(rates)),
+                    "max": float(np.max(rates)),
+                    "mean": float(np.mean(rates)),
+                    "median": float(np.median(rates)),
+                    "std": float(np.std(rates))
+                }
+            else:
+                summary["rate_analysis"] = {
+                    "count": len(rates),
+                    "min": min(rates),
+                    "max": max(rates),
+                    "mean": sum(rates) / len(rates)
+                }
+
+        # Fee analysis
+        fees = [p.fee for p in products if p.fee is not None]
+        if fees:
+            if NUMPY_AVAILABLE:
+                summary["fee_analysis"] = {
+                    "count": len(fees),
+                    "min": float(np.min(fees)),
+                    "max": float(np.max(fees)),
+                    "mean": float(np.mean(fees)),
+                    "free_count": len([f for f in fees if f == 0])
+                }
+            else:
+                summary["fee_analysis"] = {
+                    "count": len(fees),
+                    "min": min(fees),
+                    "max": max(fees),
+                    "mean": sum(fees) / len(fees),
+                    "free_count": len([f for f in fees if f == 0])
+                }
+
+        # LTV analysis
+        ltvs = [p.ltv_max for p in products if p.ltv_max is not None]
+        if ltvs:
+            ltv_ranges = {"50-60%": 0, "60-75%": 0, "75-85%": 0, "85-95%": 0, "95%+": 0}
+            for ltv in ltvs:
+                if ltv <= 60:
+                    ltv_ranges["50-60%"] += 1
+                elif ltv <= 75:
+                    ltv_ranges["60-75%"] += 1
+                elif ltv <= 85:
+                    ltv_ranges["75-85%"] += 1
+                elif ltv <= 95:
+                    ltv_ranges["85-95%"] += 1
+                else:
+                    ltv_ranges["95%+"] += 1
+            summary["ltv_analysis"] = ltv_ranges
+
+        # Special features analysis
+        all_features = []
+        for product in products:
+            all_features.extend(product.special_features)
+
+        for feature in set(all_features):
+            summary["special_features_analysis"][feature] = all_features.count(feature)
+
+        return summary
+
+    def find_best_rates(self, products: List[MortgageProduct],
+                        product_type: Optional[str] = None,
+                        customer_type: Optional[str] = None,
+                        max_ltv: Optional[float] = None,
+                        limit: int = 10) -> List[MortgageProduct]:
+        """Find best rates based on criteria"""
+        filtered = [p for p in products if p.rate is not None]
+
+        if product_type:
+            filtered = [p for p in filtered if product_type.lower() in p.product_type.lower()]
+
+        if customer_type:
+            filtered = [p for p in filtered if customer_type.lower() in p.customer_type.lower()]
+
+        if max_ltv:
+            filtered = [p for p in filtered if p.ltv_max is not None and p.ltv_max >= max_ltv]
+
+        # Sort by rate
+        sorted_products = sorted(filtered, key=lambda x: x.rate)
+        return sorted_products[:limit]
+
+
+def main():
+    """Main command line interface"""
+    parser = argparse.ArgumentParser(
+        description="Enhanced UK Mortgage Rate PDF Parser",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --file mortgage_rates.pdf
+  %(prog)s --directory /path/to/pdfs --output results
+  %(prog)s --file rates.pdf --debug --validate --summary
+  %(prog)s --directory pdfs/ --format json --find-best-rates
+        """
+    )
+
+    parser.add_argument('--file', type=str, help='Single PDF file to process')
+    parser.add_argument('--directory', type=str, help='Directory containing PDF files')
+    parser.add_argument('--output', type=str, default='mortgage_products',
+                        help='Output filename prefix (default: mortgage_products)')
+    parser.add_argument('--format', choices=['json', 'csv', 'both'], default='both',
+                        help='Output format (default: both)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--validate', action='store_true', help='Validate extracted products')
+    parser.add_argument('--summary', action='store_true', help='Generate summary report')
+    parser.add_argument('--find-best-rates', action='store_true', help='Find and display best rates')
+
+    args = parser.parse_args()
+
+    if not args.file and not args.directory:
+        parser.error("Must specify either --file or --directory")
+
+    # Initialize parser
+    mortgage_parser = EnhancedMortgageParser(debug=args.debug)
+
+    print("Enhanced UK Mortgage Rate PDF Parser")
+    print("=" * 40)
+
+    # Process files
+    if args.file:
+        print(f"Processing single file: {args.file}")
+        products, errors = mortgage_parser.process_pdf_file(args.file)
+    else:
+        print(f"Processing directory: {args.directory}")
+        products, errors = mortgage_parser.process_directory(args.directory)
+
+    # Validate products if requested
+    if args.validate:
+        print("Validating products...")
+        products, validation_errors = mortgage_parser.validate_products(products)
+        errors.extend(validation_errors)
+
+    # Print results
+    print(f"\nResults Summary:")
+    print(f"  Files processed: {mortgage_parser.stats['files_processed']}")
+    print(f"  Products extracted: {len(products)}")
+    print(f"  Errors encountered: {len(errors)}")
+    print(f"  Validation failures: {mortgage_parser.stats['validation_failures']}")
+
+    if errors and args.debug:
+        print(f"\nErrors:")
+        for error in errors[:10]:  # Show first 10 errors
+            print(f"  • {error}")
+        if len(errors) > 10:
+            print(f"  ... and {len(errors) - 10} more errors")
+
+    if products:
+        # Export data
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_name = f"{args.output}_{timestamp}"
+
+        if args.format in ['json', 'both']:
+            mortgage_parser.export_to_json(products, f"{output_name}.json")
+
+        if args.format in ['csv', 'both']:
+            mortgage_parser.export_to_csv(products, f"{output_name}.csv")
+
+        # Generate summary report
+        if args.summary:
+            print("\nGenerating summary report...")
+            summary = mortgage_parser.generate_summary_report(products)
+
+            with open(f"{output_name}_summary.json", 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+
+            print(f"\nSummary Statistics:")
+            print(f"  Lenders: {len(summary['lender_breakdown'])}")
+            for lender, count in summary['lender_breakdown'].items():
+                print(f"    {lender}: {count} products")
+
+            if summary.get('rate_analysis'):
+                rate_stats = summary['rate_analysis']
+                print(f"  Rate range: {rate_stats.get('min', 'N/A'):.2f}% - {rate_stats.get('max', 'N/A'):.2f}%")
+                print(f"  Average rate: {rate_stats.get('mean', 'N/A'):.2f}%")
+
+        # Find best rates
+        if args.find_best_rates:
+            print("\nFinding best rates...")
+
+            # Overall best rates
+            best_rates = mortgage_parser.find_best_rates(products, limit=5)
+            if best_rates:
+                print("\nTop 5 Best Rates (Overall):")
+                for i, product in enumerate(best_rates, 1):
+                    print(
+                        f"  {i}. {product.lender} - {product.product_type} - {product.rate:.2f}% - £{product.fee or 0} fee")
+
+            # Best 2-year fixed rates
+            best_2yr = mortgage_parser.find_best_rates(products, product_type="2 Year Fixed", limit=3)
+            if best_2yr:
+                print("\nTop 3 Best 2-Year Fixed Rates:")
+                for i, product in enumerate(best_2yr, 1):
+                    print(f"  {i}. {product.lender} - {product.rate:.2f}% - £{product.fee or 0} fee")
+
+        print(f"\nFiles exported with prefix: {output_name}")
+    else:
+        print("\nNo products were successfully extracted.")
+
+    print("\nProcessing completed!")
+
+
+if __name__ == "__main__":
+    main()
